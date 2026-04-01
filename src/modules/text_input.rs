@@ -1,6 +1,6 @@
 /*
 Made by: Mathew Dusome
-May 2 2025
+Mar 31 2026 Second Release
 Adds a text input object
 
 In your mod.rs file located in the modules folder add the following to the end of the file
@@ -14,7 +14,16 @@ Then to use this you would put the following above the loop:
     let mut txt_input = TextInput::new(100.0, 100.0, 300.0, 40.0, 25.0);
 Where the parameters are x, y, width, height, font size
 
+
 You can customize the text box using various methods:
+
+LIMITS AND MULTILINE:
+    // Set a maximum number of characters
+    txt_input.set_max_chars(50);
+
+    // Enable multiline mode (text wraps within the box)
+    txt_input.set_multiline(true);
+
 
 APPEARANCE CUSTOMIZATION:
     // Set colors (text, border, background, cursor)
@@ -72,6 +81,8 @@ use macroquad::prelude::*;
 use crate::modules::scale::mouse_position_world as mouse_position;
 
 pub struct TextInput {
+        // For vertical navigation, store the preferred column
+        preferred_col: Option<usize>,
     // Make all fields private for complete encapsulation
     x: f32,
     y: f32,
@@ -97,11 +108,93 @@ pub struct TextInput {
     last_key: Option<KeyCode>, // Track the last key that was pressed
     enabled: bool,          // Controls whether the text input can be interacted with
     disabled_color: Color,  // Color used when the text input is disabled
+    // New: Multiline and max chars support
+    multiline: bool,        // If true, wraps text to next line within box
+    max_chars: Option<usize>, // Optional maximum number of characters
 }
 
 impl TextInput {
+    /// Returns (wrapped_lines, mapping) where mapping[byte_idx] = (line, col)
+    fn get_wrapped_lines_and_mapping(&self) -> (Vec<String>, Vec<(usize, usize)>) {
+        if !self.multiline {
+            // Single line: mapping is just (0, col) for each char
+            let mut mapping = Vec::new();
+            let mut col = 0;
+            for (i, c) in self.text.char_indices() {
+                mapping.resize(i + c.len_utf8(), (0, col));
+                col += 1;
+            }
+            mapping.resize(self.text.len() + 1, (0, col));
+            return (vec![self.text.clone()], mapping);
+        }
+        let mut lines = Vec::new();
+        let mut mapping = vec![(0, 0); self.text.len() + 1];
+        let padding = 5.0;
+        let max_width = self.width - 2.0 * padding;
+        let font = self.font.as_ref();
+        let mut line_idx: usize = 0;
+        let mut col_idx = 0;
+        let mut current_line = String::new();
+        let mut current_width = 0.0;
+        let mut byte_idx = 0;
+        let mut chars = self.text.chars().peekable();
+        while let Some(c) = chars.next() {
+            let c_width = measure_text(&c.to_string(), font, self.font_size as u16, 1.0).width;
+            let is_newline = c == '\n';
+            // If wrapping needed (but not for newline)
+            if !is_newline && current_width + c_width > max_width && !current_line.is_empty() {
+                lines.push(current_line.clone());
+                current_line.clear();
+                current_width = 0.0;
+                line_idx += 1;
+                col_idx = 0;
+            }
+            if is_newline {
+                lines.push(current_line.clone());
+                current_line.clear();
+                current_width = 0.0;
+                line_idx += 1;
+                col_idx = 0;
+                mapping[byte_idx] = (line_idx, col_idx); // Map the newline byte
+                byte_idx += c.len_utf8();
+                continue;
+            }
+            current_line.push(c);
+            // Map every byte of this char to the current (line, col)
+            let char_bytes = c.len_utf8();
+            for i in 0..char_bytes {
+                if byte_idx + i < mapping.len() {
+                    mapping[byte_idx + i] = (line_idx, col_idx);
+                }
+            }
+            byte_idx += char_bytes;
+            current_width += c_width;
+            col_idx += 1;
+        }
+        if !current_line.is_empty() {
+            lines.push(current_line);
+            line_idx += 1;
+        }
+        // Map the end of the text
+        if byte_idx < mapping.len() {
+            mapping[byte_idx] = (line_idx.saturating_sub(1), lines.last().map(|l| l.chars().count()).unwrap_or(0));
+        }
+        (lines, mapping)
+    }
+
+        /// Ensure the cursor index is always at a valid UTF-8 boundary and in bounds
+        fn ensure_cursor_validity(&mut self) {
+            if self.cursor_index > self.text.len() {
+                self.cursor_index = self.text.len();
+            }
+            // Clamp to char boundary
+            while self.cursor_index > 0 && !self.text.is_char_boundary(self.cursor_index) {
+                self.cursor_index -= 1;
+            }
+        }
     pub fn new(x: f32, y: f32, width: f32, height: f32, font_size: f32) -> Self {
-        Self {
+                Self {
+                        preferred_col: None,
             x,
             y,
             width,
@@ -126,7 +219,20 @@ impl TextInput {
             last_key: None,
             enabled: true, // Default to enabled
             disabled_color: Color::new(0.7, 0.7, 0.7, 0.5), // Semi-transparent gray for disabled state
+            multiline: false,
+            max_chars: None,
         }
+    }
+
+    /// Enable or disable multiline mode (wrapping within box)
+    #[allow(unused)]
+    pub fn set_multiline(&mut self, multiline: bool) -> &mut Self {
+        self.multiline = multiline;
+        self
+    }
+    #[allow(unused)]
+    pub fn is_multiline(&self) -> bool {
+        self.multiline
     }
     
     // Position and dimension getters/setters
@@ -433,36 +539,45 @@ impl TextInput {
         if is_mouse_button_pressed(MouseButton::Left) {
             let (mx, my) = mouse_position();
             self.active = mx >= self.x && mx <= self.x + self.width && my >= self.y && my <= self.y + self.height;
-    
+
             if self.active {
-                // Clicking to place the cursor
                 let text_x = self.x + 5.0;
-                let mouse_pos = mx - text_x;
-                self.cursor_index = 0;
-    
-                let mut cursor_offset = 0.0;
-                while self.cursor_index < self.text.len() {
-                    let char_width = match &self.font {
-                        Some(font) => measure_text(
-                            &self.text[self.cursor_index..self.cursor_index + 1], 
-                            Some(font), 
-                            self.font_size as u16, 
-                            1.0
-                        ).width,
-                        None => measure_text(
-                            &self.text[self.cursor_index..self.cursor_index + 1], 
-                            None, 
-                            self.font_size as u16, 
-                            1.0
-                        ).width,
-                    };
-                    
-                    cursor_offset += char_width;
-                    if cursor_offset > mouse_pos {
-                        break;
+                let text_y = self.y + 5.0;
+                let mouse_x = mx - text_x;
+                let mouse_y = my - text_y;
+                let (wrapped_lines, mapping) = self.get_wrapped_lines_and_mapping();
+                // Determine which line was clicked
+                let line_height = self.font_size + 2.0;
+                let clicked_line = (mouse_y / line_height).floor() as usize;
+                let clicked_line = clicked_line.min(wrapped_lines.len().saturating_sub(1));
+                // Now, find the closest column in that line
+                let mut col = 0;
+                let mut x_offset = 0.0;
+                let font = self.font.as_ref();
+                if clicked_line < wrapped_lines.len() {
+                    let line = &wrapped_lines[clicked_line];
+                    for (i, c) in line.chars().enumerate() {
+                        let c_width = measure_text(&c.to_string(), font, self.font_size as u16, 1.0).width;
+                        if x_offset + c_width / 2.0 > mouse_x {
+                            break;
+                        }
+                        x_offset += c_width;
+                        col = i + 1;
                     }
-                    self.cursor_index += self.text[self.cursor_index..].chars().next().unwrap().len_utf8();
                 }
+                // Find the last byte index in mapping that matches (clicked_line, col)
+                let mut last_match = None;
+                for (byte_idx, &(line, ccol)) in mapping.iter().enumerate() {
+                    if line == clicked_line && ccol == col {
+                        last_match = Some(byte_idx);
+                    }
+                }
+                if let Some(byte_idx) = last_match {
+                    self.cursor_index = byte_idx;
+                } else {
+                    self.cursor_index = self.text.len();
+                }
+                self.ensure_cursor_validity();
             }
         }
     
@@ -470,22 +585,37 @@ impl TextInput {
             // Handle typing
             while let Some(c) = get_char_pressed() {
                 if !c.is_control() {
-                    self.text.insert(self.cursor_index, c);
-                    self.cursor_index += c.len_utf8();
+                    // Enforce max_chars if set
+                    if self.max_chars.map_or(true, |max| self.text.chars().count() < max) {
+                        self.text.insert(self.cursor_index, c);
+                        self.cursor_index += c.len_utf8();
+                        self.ensure_cursor_validity();
+                    }
                 }
             }
-    
+            // Handle Enter key for multiline
+            if self.multiline && is_key_pressed(KeyCode::Enter) {
+                if self.max_chars.map_or(true, |max| self.text.chars().count() < max) {
+                    self.text.insert(self.cursor_index, '\n');
+                    self.cursor_index += 1;
+                    self.ensure_cursor_validity();
+                }
+            }
+
             // Initial key presses
             let key_delete_pressed = is_key_pressed(KeyCode::Delete);
             let key_backspace_pressed = is_key_pressed(KeyCode::Backspace);
             let key_left_pressed = is_key_pressed(KeyCode::Left);
             let key_right_pressed = is_key_pressed(KeyCode::Right);
-            
+            let key_up_pressed = is_key_pressed(KeyCode::Up);
+            let key_down_pressed = is_key_pressed(KeyCode::Down);
+
             // Handle initial key presses
             if key_delete_pressed && self.cursor_index < self.text.len() {
                 if let Some((_, c)) = self.text[self.cursor_index..].char_indices().next() {
                     let char_len = c.len_utf8();
                     self.text.replace_range(self.cursor_index..self.cursor_index + char_len, "");
+                    self.ensure_cursor_validity();
                 }
                 self.last_key = Some(KeyCode::Delete);
                 self.key_repeat_timer = 0.0;
@@ -493,6 +623,7 @@ impl TextInput {
                 if let Some((prev_offset, _c)) = self.text[..self.cursor_index].char_indices().rev().next() {
                     self.text.replace_range(prev_offset..self.cursor_index, "");
                     self.cursor_index = prev_offset;
+                    self.ensure_cursor_validity();
                 }
                 self.last_key = Some(KeyCode::Backspace);
                 self.key_repeat_timer = 0.0;
@@ -500,14 +631,60 @@ impl TextInput {
                 let prev_char = self.text[..self.cursor_index].chars().last().unwrap();
                 let char_len = prev_char.len_utf8();
                 self.cursor_index -= char_len;
+                self.ensure_cursor_validity();
                 self.last_key = Some(KeyCode::Left);
                 self.key_repeat_timer = 0.0;
+                self.preferred_col = None;
             } else if key_right_pressed && self.cursor_index < self.text.len() {
                 let next_char = self.text[self.cursor_index..].chars().next().unwrap();
                 let char_len = next_char.len_utf8();
                 self.cursor_index += char_len;
+                self.ensure_cursor_validity();
                 self.last_key = Some(KeyCode::Right);
                 self.key_repeat_timer = 0.0;
+                self.preferred_col = None;
+            } else if self.multiline && (key_up_pressed || key_down_pressed) {
+                // Robust multiline up/down navigation using mapping
+                let (wrapped_lines, mapping) = self.get_wrapped_lines_and_mapping();
+                let cursor_idx = self.cursor_index.min(self.text.len());
+                let (cur_line, cur_col) = if cursor_idx < mapping.len() {
+                    mapping[cursor_idx]
+                } else {
+                    (wrapped_lines.len().saturating_sub(1), wrapped_lines.last().map(|l| l.chars().count()).unwrap_or(0))
+                };
+                // Store preferred_col for vertical navigation
+                if self.preferred_col.is_none() {
+                    self.preferred_col = Some(cur_col);
+                }
+                let mut new_line = cur_line;
+                if key_up_pressed && cur_line > 0 {
+                    new_line = cur_line - 1;
+                } else if key_down_pressed && cur_line + 1 < wrapped_lines.len() {
+                    new_line = cur_line + 1;
+                }
+                if new_line != cur_line {
+                    let preferred_col = self.preferred_col.unwrap_or(cur_col);
+                    let new_line_len = wrapped_lines[new_line].chars().count();
+                    let new_col = preferred_col.min(new_line_len);
+                    // Find the last byte index in mapping that matches (new_line, new_col)
+                    let mut last_match = None;
+                    for (byte_idx, &(line, col)) in mapping.iter().enumerate() {
+                        if line == new_line && col == new_col {
+                            last_match = Some(byte_idx);
+                        }
+                    }
+                    if let Some(byte_idx) = last_match {
+                        self.cursor_index = byte_idx;
+                        self.ensure_cursor_validity();
+                    } else {
+                        self.cursor_index = self.text.len();
+                        self.ensure_cursor_validity();
+                    }
+                }
+                // Reset preferred_col if left/right or typing
+                if key_left_pressed || key_right_pressed || get_char_pressed().is_some() {
+                    self.preferred_col = None;
+                }
             }
 
             // Handle key repeat functionality
@@ -522,6 +699,7 @@ impl TextInput {
                                     let prev_char = self.text[..self.cursor_index].chars().last().unwrap();
                                     let char_len = prev_char.len_utf8();
                                     self.cursor_index -= char_len;
+                                    self.ensure_cursor_validity();
                                 }
                             }
                             KeyCode::Right => {
@@ -529,6 +707,7 @@ impl TextInput {
                                     let next_char = self.text[self.cursor_index..].chars().next().unwrap();
                                     let char_len = next_char.len_utf8();
                                     self.cursor_index += char_len;
+                                    self.ensure_cursor_validity();
                                 }
                             }
                             KeyCode::Delete => {
@@ -536,6 +715,7 @@ impl TextInput {
                                     if let Some((_, c)) = self.text[self.cursor_index..].char_indices().next() {
                                         let char_len = c.len_utf8();
                                         self.text.replace_range(self.cursor_index..self.cursor_index + char_len, "");
+                                        self.ensure_cursor_validity();
                                     }
                                 }
                             }
@@ -544,6 +724,7 @@ impl TextInput {
                                     if let Some((prev_offset, _c)) = self.text[..self.cursor_index].char_indices().rev().next() {
                                         self.text.replace_range(prev_offset..self.cursor_index, "");
                                         self.cursor_index = prev_offset;
+                                        self.ensure_cursor_validity();
                                     }
                                 }
                             }
@@ -560,30 +741,30 @@ impl TextInput {
             if self.cursor_timer >= 0.5 {
                 self.cursor_visible = !self.cursor_visible;
                 self.cursor_timer = 0.0;
-            } 
+            }
         } else {
-            self.cursor_visible = false; 
+            self.cursor_visible = false;
         }
     }
+
     
     // Now private - internal implementation only
     fn draw_internal(&self) {
         let padding = 5.0;
         let text_x = self.x + padding;
-        let text_y = self.y + self.height / 2.0 + self.font_size / 2.5;
-    
+        let text_y = self.y + self.font_size + padding;
+
         // Draw the background with customizable colors (or disabled color when disabled)
         if self.enabled {
             draw_rectangle(self.x, self.y, self.width, self.height, self.background_color);
         } else {
-            // Use the disabled color for the background when disabled
             draw_rectangle(self.x, self.y, self.width, self.height, self.disabled_color);
         }
-        
-        // Draw text with the appropriate font and color based on enabled state
+
         let text_color = if self.enabled { self.text_color } else { GRAY };
         let prompt_color = if self.enabled { self.prompt_color } else { GRAY };
-        
+
+        // Draw text (with wrapping if multiline)
         if self.text.is_empty() {
             if let Some(prompt) = &self.prompt {
                 match &self.font {
@@ -606,61 +787,85 @@ impl TextInput {
                 }
             }
         } else {
-            match &self.font {
-                Some(font) => {
-                    draw_text_ex(
-                        &self.text,
-                        text_x,
-                        text_y,
-                        TextParams {
-                            font: Some(font),
-                            font_size: self.font_size as u16,
-                            color: text_color,
-                            ..Default::default()
-                        },
-                    );
-                },
-                None => {
-                    draw_text(&self.text, text_x, text_y, self.font_size, text_color);
+            let (wrapped_lines, _mapping) = self.get_wrapped_lines_and_mapping();
+            for (i, line) in wrapped_lines.iter().enumerate() {
+                let y = text_y + i as f32 * (self.font_size + 2.0);
+                match &self.font {
+                    Some(font) => {
+                        draw_text_ex(
+                            line,
+                            text_x,
+                            y,
+                            TextParams {
+                                font: Some(font),
+                                font_size: self.font_size as u16,
+                                color: text_color,
+                                ..Default::default()
+                            },
+                        );
+                    },
+                    None => {
+                        draw_text(line, text_x, y, self.font_size, text_color);
+                    }
                 }
             }
         }
-    
-        // Only show cursor if enabled and active
+
+        // Cursor rendering for multiline (basic support)
         if self.enabled && self.active && self.cursor_visible {
-            let mut cursor_offset = 0.0;
-            if self.cursor_index > 0 {
-                let cursor_text = &self.text[..self.cursor_index];
-                
-                // Calculate cursor position based on font
-                if let Some(font) = &self.font {
-                    // Use custom font for measurement
-                    for c in cursor_text.chars() {
-                        cursor_offset += measure_text(&c.to_string(), Some(font), self.font_size as u16, 1.0).width;
-                    }
+            if self.multiline {
+                // Use the same mapping as navigation for accurate cursor placement
+                let (wrapped_lines, mapping) = self.get_wrapped_lines_and_mapping();
+                let cursor_idx = self.cursor_index.min(self.text.len());
+                let (cursor_line, cursor_col) = if cursor_idx < mapping.len() {
+                    mapping[cursor_idx]
                 } else {
-                    // Use default font for measurement
-                    for c in cursor_text.chars() {
-                        cursor_offset += measure_text(&c.to_string(), None, self.font_size as u16, 1.0).width;
+                    (wrapped_lines.len().saturating_sub(1), wrapped_lines.last().map(|l| l.chars().count()).unwrap_or(0))
+                };
+                let mut cursor_offset = 0.0;
+                let font = self.font.as_ref();
+                if cursor_line < wrapped_lines.len() {
+                    let line = &wrapped_lines[cursor_line];
+                    for c in line.chars().take(cursor_col) {
+                        cursor_offset += measure_text(&c.to_string(), font, self.font_size as u16, 1.0).width;
                     }
                 }
+                let cursor_spacing = 2.0;
+                let y = text_y + cursor_line as f32 * (self.font_size + 2.0);
+                draw_line(
+                    text_x + cursor_offset + cursor_spacing,
+                    y - self.font_size * 0.7,
+                    text_x + cursor_offset + cursor_spacing,
+                    y + 2.0,
+                    1.0,
+                    self.cursor_color,
+                );
+            } else {
+                let mut cursor_offset = 0.0;
+                if self.cursor_index > 0 {
+                    let cursor_text = &self.text[..self.cursor_index];
+                    if let Some(font) = &self.font {
+                        for c in cursor_text.chars() {
+                            cursor_offset += measure_text(&c.to_string(), Some(font), self.font_size as u16, 1.0).width;
+                        }
+                    } else {
+                        for c in cursor_text.chars() {
+                            cursor_offset += measure_text(&c.to_string(), None, self.font_size as u16, 1.0).width;
+                        }
+                    }
+                }
+                let cursor_spacing = 2.0;
+                draw_line(
+                    text_x + cursor_offset + cursor_spacing,
+                    text_y - self.font_size * 0.7,
+                    text_x + cursor_offset + cursor_spacing,
+                    text_y + 2.0,
+                    1.0,
+                    self.cursor_color,
+                );
             }
-    
-            // Add a small spacing between the text and cursor (2.0 pixels)
-            let cursor_spacing = 2.0;
-            
-             // Draw the cursor with customizable color and added spacing
-             draw_line(
-                text_x + cursor_offset + cursor_spacing,
-                text_y - self.font_size * 0.7,  // Reduce the height of cursor above text
-                text_x + cursor_offset + cursor_spacing,
-                text_y + 2.0,  // Reduce the height of cursor below text
-                1.0,  // Reduce thickness from 2.0 to 1.0
-                self.cursor_color,
-            );
         }
-    
-        // Draw the border with customizable color
+
         let border_color = if self.enabled { self.border_color } else { GRAY };
         draw_rectangle_lines(self.x, self.y, self.width, self.height, 2.0, border_color);
     }
